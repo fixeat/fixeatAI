@@ -11,7 +11,9 @@ from typing import Any, List, Optional
 import hashlib
 import json
 import os
+import re
 from datetime import datetime
+from urllib.parse import unquote, urlparse
 import requests
 from bs4 import BeautifulSoup
 import base64
@@ -49,10 +51,107 @@ def upsert_taxonomy(req: UpsertTaxonomyRequest) -> dict:
     return {"ok": True, "changed": changed}
 
 
+def _metadata_where(clauses: list[dict[str, Any]]) -> dict[str, Any] | None:
+    """Build a Chroma metadata filter from non-empty equality clauses."""
+    clean = [clause for clause in clauses if clause]
+    if not clean:
+        return None
+    if len(clean) == 1:
+        return clean[0]
+    return {"$and": clean}
+
+
+def _source_parts(source: str) -> tuple[str, list[str]]:
+    """Return decoded filename and path parts for an S3/HTTP/local source."""
+    if not source:
+        return "", []
+    parsed = urlparse(source)
+    raw_path = parsed.path if parsed.scheme else source
+    decoded_path = unquote(raw_path).strip("/")
+    parts = [part for part in decoded_path.split("/") if part]
+    filename = parts[-1] if parts else ""
+    return filename, parts
+
+
+def _infer_source_metadata(metadata: dict[str, Any], doc_id: str = "") -> dict[str, Any]:
+    """Normalize KB source metadata used for scoped technical retrieval.
+
+    The IA scope should not depend on brittle client-side URL checks. We still
+    infer these fields from existing URLs/doc_ids so old ingestion flows get the
+    same metadata without requiring callers to provide every field manually.
+    """
+    enriched = dict(metadata or {})
+    source = str(enriched.get("source") or enriched.get("source_ref") or doc_id or "")
+    filename, parts = _source_parts(source)
+    lower_parts = [part.lower() for part in parts]
+    filename_no_ext = filename.rsplit(".", 1)[0] if filename else ""
+
+    if source:
+        enriched.setdefault("source", source)
+    if filename:
+        enriched.setdefault("source_file", filename)
+    if len(parts) > 1:
+        enriched.setdefault("source_prefix", "/".join(parts[:-1]) + "/")
+    parsed = urlparse(source)
+    if parsed.netloc:
+        enriched.setdefault("source_bucket", parsed.netloc.split(".")[0])
+
+    is_ia = (
+        "ia" in lower_parts
+        or filename_no_ext.lower().endswith("_ia")
+        or "_ia" in str(doc_id).lower()
+    )
+    if is_ia:
+        enriched.setdefault("kb_scope", "IA")
+        enriched.setdefault("is_ai_document", True)
+
+    # Infer brand/line from common S3 shapes:
+    #   /IA/Rational/ICombi/file.pdf
+    #   /kb/Rational/ICombi/ICombi/file.pdf
+    for marker in ("ia", "kb"):
+        if marker in lower_parts:
+            idx = lower_parts.index(marker)
+            if len(parts) > idx + 1:
+                enriched.setdefault("brand", parts[idx + 1])
+            if len(parts) > idx + 2:
+                enriched.setdefault("line", parts[idx + 2])
+            break
+
+    return enriched
+
+
+def _extract_error_codes(text: str) -> list[str]:
+    """Extract service/error codes as scalar strings safe for Chroma metadata."""
+    if not text:
+        return []
+    patterns = [
+        r"\bS[_\-\s]?(\d+(?:[._]\d+)*)\b",
+        r"\bservicio\s+(\d+(?:[._]\d+)*)\b",
+        r"\bservice\s+(\d+(?:[._]\d+)*)\b",
+        r"\berror\s+(\d+(?:[._]\d+)*)\b",
+    ]
+    codes: set[str] = set()
+    for pattern in patterns:
+        for match in re.findall(pattern, text, flags=re.IGNORECASE):
+            codes.add(match.replace("_", "."))
+    return sorted(codes, key=lambda value: (len(value), value))
+
+
+def _enrich_kb_metadata(metadata: dict[str, Any], doc_id: str, text: str = "") -> dict[str, Any]:
+    """Add normalized source/scope and error-code metadata to a KB item."""
+    enriched = _infer_source_metadata(metadata, doc_id)
+    codes = _extract_error_codes(text)
+    if codes:
+        enriched.setdefault("primary_error_code", codes[0])
+        enriched["error_codes"] = ",".join(codes)
+    return enriched
+
+
 class KBSearchRequest(BaseModel):
     query: str
     top_k: int = 5
     where: Optional[dict[str, Any]] = None
+    where_document: Optional[dict[str, Any]] = None
 
 
 class KBSearchExtendedRequest(BaseModel):
@@ -60,6 +159,7 @@ class KBSearchExtendedRequest(BaseModel):
     query: str
     top_k: int = 5
     where: Optional[dict[str, Any]] = None
+    where_document: Optional[dict[str, Any]] = None
     context_chars: int = 2000
     include_full_text: bool = False
     highlight_terms: bool = True  # NUEVO: Fase 3 - highlighting de términos
@@ -79,7 +179,7 @@ def _seed_data() -> None:
 @app.post("/tools/kb_search")
 def tool_kb_search(req: KBSearchRequest) -> dict:
     """Búsqueda semántica en KB (versión original)."""
-    hits = kb_search(req.query, req.top_k, req.where)
+    hits = kb_search(req.query, req.top_k, req.where, req.where_document)
     return {"hits": hits}
 
 
@@ -105,6 +205,7 @@ def tool_kb_search_extended(req: KBSearchExtendedRequest) -> dict:
             query=req.query,
             top_k=req.top_k,
             where=req.where,
+            where_document=req.where_document,
             context_chars=req.context_chars,
             include_full_text=req.include_full_text,
             highlight_terms=req.highlight_terms
@@ -131,6 +232,7 @@ class KBSearchHybridRequest(BaseModel):
     query: str
     top_k: int = 10
     where: Optional[dict[str, Any]] = None
+    where_document: Optional[dict[str, Any]] = None
     semantic_weight: float = 0.5
     keyword_weight: float = 0.5
     context_chars: int = 2000
@@ -164,6 +266,7 @@ def tool_kb_search_hybrid(req: KBSearchHybridRequest) -> dict:
             query=req.query,
             top_k=req.top_k,
             where=req.where,
+            where_document=req.where_document,
             semantic_weight=req.semantic_weight,
             keyword_weight=req.keyword_weight,
             context_chars=req.context_chars
@@ -219,6 +322,100 @@ def tool_db_query(req: DBQueryRequest) -> dict:
     else:
         rows = []
     return {"rows": rows, "count": len(rows)}
+
+
+class KBSearchTechnicalErrorRequest(BaseModel):
+    """Request focused on service/error-code retrieval for technicians."""
+    query: str
+    error_code: str
+    brand: Optional[str] = None
+    line: Optional[str] = None
+    kb_scope: Optional[str] = "IA"
+    source: Optional[str] = None
+    top_k: int = 10
+    context_chars: int = 2000
+    semantic_weight: float = 0.2
+    keyword_weight: float = 0.8
+
+
+@app.post("/tools/kb_search_error")
+def tool_kb_search_error(req: KBSearchTechnicalErrorRequest) -> dict:
+    """Search KB for a technical service/error code within the intended IA scope.
+
+    This endpoint centralizes the recommended filters for technician input such
+    as "tengo el error service 110". It avoids making API clients compose
+    fragile `where` payloads manually.
+    """
+    error_code = req.error_code.strip()
+    query = req.query
+    if error_code and error_code not in query:
+        query = f"{query} servicio {error_code} service {error_code} S_{error_code}"
+
+    clauses: list[dict[str, Any]] = []
+    if req.source:
+        clauses.append({"source": req.source})
+    else:
+        if req.brand:
+            clauses.append({"brand": req.brand})
+        if req.line:
+            clauses.append({"line": req.line})
+        if req.kb_scope:
+            clauses.append({"kb_scope": req.kb_scope})
+
+    where = _metadata_where(clauses)
+    where_document = {"$contains": error_code} if error_code else None
+    hits = kb_search_hybrid(
+        query=query,
+        top_k=max(req.top_k * 3, req.top_k),
+        where=where,
+        where_document=where_document,
+        semantic_weight=req.semantic_weight,
+        keyword_weight=req.keyword_weight,
+        context_chars=req.context_chars,
+    )
+
+    code_regex = re.compile(
+        rf"\b(?:s[_\-\s]?{re.escape(error_code)}|servicio\s*{re.escape(error_code)}|service\s*{re.escape(error_code)}|error\s*{re.escape(error_code)}|{re.escape(error_code)})\b",
+        re.IGNORECASE,
+    ) if error_code else None
+
+    def technical_score(hit: dict[str, Any]) -> float:
+        metadata = hit.get("metadata", {}) or {}
+        text = str(hit.get("context") or hit.get("snippet") or "")
+        source = str(metadata.get("source", ""))
+        score = float(hit.get("score", 0.0) or 0.0)
+        boosts: dict[str, float] = {}
+
+        if error_code and metadata.get("primary_error_code") == error_code:
+            boosts["primary_error_code"] = 3.0
+        if error_code and error_code in str(metadata.get("error_codes", "")).split(","):
+            boosts["error_codes"] = 2.0
+        if code_regex and code_regex.search(text):
+            boosts["text_code_match"] = 2.0
+        if metadata.get("kb_scope") == "IA" or metadata.get("is_ai_document") is True:
+            boosts["ia_scope"] = 1.0
+        if "_IA" in source or "/IA/" in source:
+            boosts["ia_source"] = 0.5
+        if req.brand and metadata.get("brand") == req.brand:
+            boosts["brand"] = 0.25
+        if req.line and metadata.get("line") == req.line:
+            boosts["line"] = 0.25
+
+        hit["technical_boosts"] = boosts
+        hit["technical_score"] = score + sum(boosts.values())
+        return hit["technical_score"]
+
+    ranked = sorted(hits, key=technical_score, reverse=True)[:req.top_k]
+    return {
+        "hits": ranked,
+        "query": req.query,
+        "expanded_query": query,
+        "error_code": error_code,
+        "where": where,
+        "where_document": where_document,
+        "total_hits": len(ranked),
+        "search_type": "technical_error",
+    }
 
 
 class IngestDoc(BaseModel):
@@ -373,7 +570,7 @@ def _build_canonical_items(base_id: str, text: str, base_metadata: dict[str, Any
     now_iso = datetime.utcnow().isoformat() + "Z"
     for idx, chunk in enumerate(chunks):
         md = {
-            **(base_metadata or {}),
+            **_enrich_kb_metadata(base_metadata or {}, base_id, chunk),
             "source_type": base_metadata.get("source_type", "unknown"),
             "source_ref": base_metadata.get("source_ref", base_id),
             "chunk_index": idx,
@@ -589,7 +786,7 @@ def _prepare_ingest_docs_from_inputs(
                 {
                     "id": d.id or (d.filename or (text_content[:40] if text_content else "doc")),
                     "text": text_content,
-                    "metadata": d.metadata or {},
+                    "metadata": _enrich_kb_metadata(d.metadata or {}, d.id or d.filename or "doc", text_content),
                 }
             )
     # desde URLs
@@ -617,7 +814,15 @@ def _prepare_ingest_docs_from_inputs(
                     except Exception:
                         text = ""
                 if text:
-                    prepared.append({"id": url, "text": text, "metadata": {"source": url, "source_type": "url", "source_ref": url}})
+                    prepared.append({
+                        "id": url,
+                        "text": text,
+                        "metadata": _enrich_kb_metadata(
+                            {"source": url, "source_type": "url", "source_ref": url},
+                            url,
+                            text,
+                        ),
+                    })
             except Exception:
                 continue
     return prepared
@@ -815,7 +1020,7 @@ def tool_kb_curate(req: KBCurateRequest) -> dict:
     
     # Procesamiento normal de curación
     for item in raw:
-        meta = item.get("metadata") or {}
+        meta = _enrich_kb_metadata(item.get("metadata") or {}, item.get("id", "doc"), item.get("text", ""))
         # Extracción automática si faltan entidades
         if not meta.get("brand") or not meta.get("model") or not meta.get("category"):
             auto = _extract_entities_from_text(item.get("text", ""))

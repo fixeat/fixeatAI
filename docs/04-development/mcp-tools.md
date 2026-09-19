@@ -71,3 +71,50 @@ Notas
 - Timeout por tool: 5s (dev), 2s (prod) con reintentos controlados.
 
 
+
+### kb_search_error
+Búsqueda técnica orientada a códigos de servicio/error. Centraliza filtros de metadata (`brand`, `line`, `kb_scope` o `source` exacto), usa filtro textual `where_document` para exigir el código en el chunk y devuelve boosts explicables (`technical_score`, `technical_boosts`).
+
+Input
+```json
+{
+  "query": "tengo el error service 110",
+  "error_code": "110",
+  "brand": "Rational",
+  "line": "ICombi",
+  "kb_scope": "IA",
+  "source": "https://fixeat-dev.s3.us-east-2.amazonaws.com/IA/Rational/ICombi/80.51.332_ET_es-ES_IA.pdf",
+  "top_k": 10,
+  "context_chars": 2500,
+  "semantic_weight": 0.2,
+  "keyword_weight": 0.8
+}
+```
+
+Output
+```json
+{
+  "hits": [
+    {
+      "doc_id": "80.51.332_ET_es-ES_IA_page_148_chunk_0",
+      "technical_score": 6.8,
+      "technical_boosts": {
+        "text_code_match": 2.0,
+        "ia_scope": 1.0,
+        "brand": 0.25,
+        "line": 0.25
+      },
+      "metadata": {
+        "brand": "Rational",
+        "line": "ICombi",
+        "kb_scope": "IA",
+        "page": 148,
+        "source": "https://.../80.51.332_ET_es-ES_IA.pdf"
+      },
+      "context": "...Servicio 110...",
+      "document_url": "https://.../80.51.332_ET_es-ES_IA.pdf#page=148"
+    }
+  ],
+  "search_type": "technical_error"
+}
+```

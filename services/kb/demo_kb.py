@@ -166,7 +166,12 @@ def _extract_context_window(
     return (context, start, end)
 
 
-def kb_search(query: str, top_k: int = 5, where: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+def kb_search(
+    query: str,
+    top_k: int = 5,
+    where: dict[str, Any] | None = None,
+    where_document: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
     """Búsqueda semántica en KB (versión original, mantiene compatibilidad).
     
     Args:
@@ -182,6 +187,8 @@ def kb_search(query: str, top_k: int = 5, where: dict[str, Any] | None = None) -
     kwargs: dict[str, Any] = {"query_embeddings": [q_emb], "n_results": top_k}
     if where and isinstance(where, dict) and len(where) > 0:
         kwargs["where"] = where
+    if where_document and isinstance(where_document, dict) and len(where_document) > 0:
+        kwargs["where_document"] = where_document
     res = _collection.query(**kwargs)
     hits: list[dict[str, Any]] = []
     for i in range(len(res["ids"][0])):
@@ -356,6 +363,7 @@ def kb_search_extended(
     query: str,
     top_k: int = 5,
     where: dict[str, Any] | None = None,
+    where_document: dict[str, Any] | None = None,
     context_chars: int = 2000,
     include_full_text: bool = False,
     highlight_terms: bool = True
@@ -399,6 +407,8 @@ def kb_search_extended(
     kwargs: dict[str, Any] = {"query_embeddings": [q_emb], "n_results": top_k}
     if where and isinstance(where, dict) and len(where) > 0:
         kwargs["where"] = where
+    if where_document and isinstance(where_document, dict) and len(where_document) > 0:
+        kwargs["where_document"] = where_document
     
     res = _collection.query(**kwargs)
     
@@ -488,10 +498,11 @@ def _detect_error_codes(query: str) -> list[str]:
 
 
 def _keyword_boost_search(
-    query: str, 
+    query: str,
     error_codes: list[str],
     top_k: int = 20,
-    where: dict[str, Any] | None = None
+    where: dict[str, Any] | None = None,
+    where_document: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Búsqueda por keyword con scoring para códigos de error.
     
@@ -507,53 +518,53 @@ def _keyword_boost_search(
     if not error_codes:
         return {}
     
-    # Construir patrones de búsqueda para cada código
-    search_patterns = []
+    # Construir patrones regex tolerantes a saltos de línea y guiones de PDF.
+    search_patterns: list[tuple[re.Pattern[str], float]] = []
     for code in error_codes:
+        escaped = re.escape(code)
         search_patterns.extend([
-            f"service {code}",
-            f"servicio {code}",
-            f"service{code}",
-            f"s_{code}",
-            f"s{code}",
-            f"error {code}",
+            (re.compile(rf"\bservicio\s*{escaped}\b", re.I), 3.0),
+            (re.compile(rf"\bservice\s*{escaped}\b", re.I), 3.0),
+            (re.compile(rf"\bs[_\-\s]?{escaped}\b", re.I), 3.0),
+            (re.compile(rf"\berror\s*{escaped}\b", re.I), 2.0),
+            (re.compile(rf"\b{escaped}\b", re.I), 0.5),
         ])
-    
-    # Obtener todos los documentos (o filtrados)
+
+    # Obtener todos los documentos (o filtrados). Chroma no soporta `$contains`
+    # sobre metadata `where`; para texto debe usarse `where_document`.
+    get_kwargs: dict[str, Any] = {"include": ["documents", "metadatas"]}
+    if where:
+        get_kwargs["where"] = where
+    if where_document:
+        get_kwargs["where_document"] = where_document
+
     try:
-        if where:
-            results = _collection.get(where=where, include=["documents", "metadatas"])
-        else:
-            results = _collection.get(include=["documents", "metadatas"])
+        results = _collection.get(**get_kwargs)
     except Exception:
         return {}
-    
-    # Scoring por matches de keywords
+
+    # Scoring por matches de keywords.
     keyword_scores = {}
     for i, doc_id in enumerate(results["ids"]):
-        text = results["documents"][i].lower() if i < len(results["documents"]) else ""
+        text = results["documents"][i] if i < len(results["documents"]) else ""
         score = 0.0
-        
-        for pattern in search_patterns:
-            # Contar ocurrencias del patrón
-            count = text.count(pattern.lower())
+
+        for pattern, pattern_weight in search_patterns:
+            count = len(pattern.findall(text))
             if count > 0:
-                # Boost score basado en:
-                # - Número de ocurrencias
-                # - Qué tan específico es el patrón
-                pattern_weight = 2.0 if "_" in pattern or pattern.startswith("service ") else 1.0
                 score += count * pattern_weight
-        
+
         if score > 0:
             keyword_scores[doc_id] = score
-    
+
     return keyword_scores
 
 
 def kb_search_hybrid(
-    query: str, 
-    top_k: int = 10, 
+    query: str,
+    top_k: int = 10,
     where: dict[str, Any] | None = None,
+    where_document: dict[str, Any] | None = None,
     semantic_weight: float = 0.5,
     keyword_weight: float = 0.5,
     context_chars: int = 2000,
@@ -583,6 +594,7 @@ def kb_search_hybrid(
             query=query,
             top_k=top_k,
             where=where,
+            where_document=where_document,
             context_chars=context_chars,
             highlight_terms=False
         )
@@ -592,6 +604,7 @@ def kb_search_hybrid(
         query=query,
         top_k=top_k * 3,  # Obtener más candidatos
         where=where,
+        where_document=where_document,
         context_chars=context_chars,
         highlight_terms=False
     )
@@ -601,7 +614,8 @@ def kb_search_hybrid(
         query=query,
         error_codes=error_codes,
         top_k=top_k * 3,
-        where=where
+        where=where,
+        where_document=where_document,
     )
     
     # 5. Normalizar scores semánticos a [0-1]
@@ -612,7 +626,8 @@ def kb_search_hybrid(
         score_range = max_sem_score - min_sem_score if max_sem_score > min_sem_score else 1.0
         
         for r in semantic_results:
-            normalized = (r["score"] - min_sem_score) / score_range
+            # Chroma devuelve distancias: menor distancia implica mayor relevancia.
+            normalized = 1.0 - ((r["score"] - min_sem_score) / score_range)
             semantic_scores[r["doc_id"]] = normalized
     
     # 6. Normalizar keyword scores a [0-1]
@@ -652,10 +667,9 @@ def kb_search_hybrid(
                         "context": doc_result["documents"][0][:context_chars] if doc_result["documents"] else "",
                         "metadata": doc_result["metadatas"][0] if doc_result["metadatas"] else {},
                         "document_url": generate_document_url(
-                            doc_result["metadatas"][0].get("source", "") if doc_result["metadatas"] else "",
-                            page=doc_result["metadatas"][0].get("page") if doc_result["metadatas"] else None,
-                            doc_id=doc_id
-                        )
+                            doc_id,
+                            doc_result["metadatas"][0] if doc_result["metadatas"] else {},
+                        ),
                     }
             except Exception:
                 continue
